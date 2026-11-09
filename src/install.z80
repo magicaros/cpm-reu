@@ -1,28 +1,30 @@
 ; =============================================================================
-;  install.z80 - REUDISK.COM : installs the REU RAM-disk as drive B: on the
-;                Commodore 64 CP/M 2.2 (44K) system, at run time.
+;  install.z80 - REUDISK.COM : installs the REU RAM-disk as drive B: and caches
+;                CCP+BDOS in REU Track 0 for Instant Warm Boot (44K/48K/Soft80)
 ; =============================================================================
 ;
 ;  Assembler : pasmo 0.5.x  (pasmo -I src -I build install.z80 REUDISK.COM)
 ;
 ;  Usage (at the A> prompt):
-;      REUDISK       install the driver and format B: (512 KB, empty directory)
-;      REUDISK K     install the driver but keep the current REU contents
-;                    (handy with VICE -reuimage/-reuimagerw)
-;      REUDISK F     driver already resident: re-format B:
+;      REUDISK       install the driver, format B:, and cache CCP+BDOS in REU
+;      REUDISK K     install the driver and cache CCP+BDOS, keeping B: files
+;      REUDISK F     driver already resident: re-format B: and refresh cache
 ;
 ;  Steps
-;   1. sanity checks: BIOS at $AA00 (44K C64 CP/M) and BIOS65 command 9
-;      ("JMP ($0906)") present at 6510 $0A3C
-;   2. copy the resident block (6510 trampoline + Z80 hooks + DPH/DPB/ALV)
-;      to Z80 $B000-$B3xx (6510 $C000-$C3xx)
+;   1. sanity checks: dynamically locate BIOS jump table via (0001h) - 3
+;      (supports 44K at $AA00, 48K at $BA00, etc.) and verify BIOS65 command 9
+;      ("JMP ($0906)") is present at 6510 $0A3C
+;   2. copy the 64-byte 6510 trampoline + PB to Z80 $F980 (6510 $0980) and the
+;      Z80 resident driver + DPH/DPB/ALV to Z80 $FE00 (6510 $0E00)
 ;   3. probe the REU through the trampoline: 1-byte stash/fetch round trips
 ;      to banks 0 and 4 (detects "no REU" and "REU smaller than 512 KB")
-;   4. format: fill all 512 KB with $E5 using fixed-C64-address DMA
-;      (16 transfers of 32 KB from one $E5 byte) -> empty directory
-;   5. patch the BIOS jump table (WBOOT, HOME, SELDSK, SETTRK, SETSEC, SETDMA,
+;   4. format (unless K): fill data tracks with $E5 using fixed-C64-address DMA
+;   5. cache CCP+BDOS (5632 bytes from BIOS_BASE - $1600) into REU Track 0
+;      (Bank 0, $0000-$15FF) with the CCP auto-boot command length cleared so
+;      every subsequent warm boot completes in ~5.6 ms from REU DMA
+;   6. patch the BIOS jump table (WBOOT, HOME, SELDSK, SETTRK, SETSEC, SETDMA,
 ;      READ, WRITE), saving each original target for pass-through
-;   6. warm boot (JP 0) so the BDOS starts with a clean login vector
+;   7. warm boot (JP 0) through our new instant REU WBOOT hook
 ; =============================================================================
 
         INCLUDE "reushared.inc"
@@ -38,12 +40,19 @@ start:  ld      sp,stack
         ld      de,m_banner
         call    print
 
-; --- 1. is this the stock Commodore 64 CP/M 2.2 BIOS? ------------------------
+; --- 1. dynamically discover BIOS jump table from (0001h) - 3 -----------------
         ld      hl,(WBOOTV)
-        ld      de,BIOS_BASE+3
-        or      a
-        sbc     hl,de
+        ld      a,l
+        cp      03h             ; WBOOT is always at BIOS_BASE + 3 ($xx03)
         jp      nz,e_bios
+        dec     hl
+        dec     hl
+        dec     hl
+        ld      (biosbase),hl   ; e.g. $AA00 (44K) or $BA00 (48K)
+        ld      a,(hl)
+        cp      0C3h            ; first entry (BOOT) must be a JP instruction
+        jp      nz,e_bios
+
         ld      hl,B65CHK       ; 6510 $0A3C: JMP ($0906)
         ld      a,(hl)
         cp      6Ch
@@ -77,12 +86,18 @@ optend:
         cp      'F'
         jp      nz,e_inst
         call    format
+        call    savewb
         ld      de,m_fmt
         call    print
         jp      0
 
-; --- 2. copy resident block ---------------------------------------------------
+; --- 2. copy 6510 trampoline ($F910) and Z80 resident block ($FE00) ----------
 install:
+        ld      hl,trampimg
+        ld      de,TRAMP_Z80
+        ld      bc,trampimg_end-trampimg
+        ldir
+
         ld      hl,resimg
         ld      de,RES_BASE
         ld      bc,resimg_end-resimg
@@ -92,7 +107,7 @@ install:
         call    reutest
         jp      nz,e_reu
 
-; --- 4. format (unless K) ----------------------------------------------------
+; --- 4. format (unless K) and stash CCP+BDOS into REU Track 0 ----------------
         ld      a,(opt)
         cp      'K'
         jr      z,nofmt
@@ -100,6 +115,7 @@ install:
         ld      de,m_fmt
         call    print
 nofmt:
+        call    savewb          ; stash CCP+BDOS into REU Track 0 for instant WBOOT
 
 ; --- 5. hook the BIOS jump table ---------------------------------------------
         ld      ix,r_table
@@ -113,7 +129,8 @@ patchlp:
         ld      d,h
         add     hl,hl
         add     hl,de           ; HL = 3 * n
-        ld      de,BIOS_BASE+1
+        ld      de,(biosbase)
+        inc     de              ; DE = BIOS_BASE + 1
         add     hl,de           ; HL -> operand of "JP xxxx" in jump table
         ld      e,(ix+3)
         ld      d,(ix+4)
@@ -135,7 +152,49 @@ patchlp:
 patched:
         ld      de,m_ok
         call    print
-        jp      0               ; warm boot through our WBOOT hook
+        jp      0               ; warm boot through our instant REU WBOOT hook!
+
+; =============================================================================
+;  savewb - compute WBOOT/BDOS/CCP addresses and stash the 5.5 KB CCP+BDOS
+;  image into REU Track 0 (Bank 0, $0000-$15FF) for instant warm boots.
+; =============================================================================
+savewb: ld      hl,(biosbase)
+        ld      de,3
+        add     hl,de
+        ld      (wbootv),hl     ; BIOS_BASE + 3
+
+        ld      hl,(biosbase)
+        ld      de,0EA00h       ; -1600h = $EA00 (CCP = BIOS_BASE - $1600)
+        add     hl,de           ; HL = CCP_BASE ($9400 on 44K, $A400 on 48K)
+        ld      (ccpz80),hl
+
+        push    hl
+        ld      de,0806h
+        add     hl,de           ; HL = BDOS_BASE ($9C06 on 44K, $AC06 on 48K)
+        ld      (bdosv),hl
+        pop     hl              ; HL = CCP_BASE
+
+        ld      de,7
+        add     hl,de
+        ld      (hl),0          ; clear CCP initial command buffer length (CCP+7)
+        ld      hl,(ccpz80)
+        ld      de,Z2C
+        add     hl,de           ; HL = 6510 address of CCP ($A400 or $B400)
+        ld      (ccp65),hl
+        ld      (PB_C64),hl
+
+        xor     a
+        ld      (PB_REU),a      ; REU $0000
+        ld      (PB_REU+1),a
+        ld      (PB_BANK),a     ; REU Bank 0
+        ld      (PB_IMASK),a
+        ld      (PB_ACR),a
+        ld      (PB_STATUS),a
+        ld      hl,WB_LEN       ; $1600 bytes (5632 bytes = CCP + BDOS)
+        ld      (PB_LEN),hl
+        ld      a,REU_STASH
+        ld      (PB_CMD),a
+        jp      call65
 
 ; =============================================================================
 ;  isinst - Z set if the driver is already resident and hooked
@@ -149,7 +208,13 @@ islp:   ld      a,(de)
         inc     hl
         inc     de
         djnz    islp
-        ld      hl,(BIOS_BASE+9*3+1)        ; SELDSK target
+        ld      hl,(biosbase)
+        ld      de,9*3+1        ; SELDSK target offset
+        add     hl,de
+        ld      a,(hl)
+        inc     hl
+        ld      h,(hl)
+        ld      l,a
         ld      de,h_seldsk
         or      a
         sbc     hl,de
@@ -270,20 +335,27 @@ fail:   call    print
         jp      0
 
 m_banner:
-        DEFB    13,10,"REUDISK 1.0 - 512K REU RAM disk for C64 CP/M 2.2",13,10,"$"
-m_ok:   DEFB    "Drive B: = REU RAM disk installed.",13,10,"$"
-m_fmt:  DEFB    "B: formatted (512K, 128 dir entries).",13,10,"$"
-m_bios: DEFB    "Not the C64 CP/M 2.2 44K BIOS - aborted.",13,10,"$"
+        DEFB    13,10,"REUDISK 1.2 - 512K REU RAM disk + Instant WBOOT",13,10,"$"
+m_ok:   DEFB    "Drive B: + Instant REU Warm Boot installed.",13,10,"$"
+m_fmt:  DEFB    "B: formatted (496K data + 16K WBOOT cache).",13,10,"$"
+m_bios: DEFB    "Incompatible C64 CP/M BIOS - aborted.",13,10,"$"
 m_inst: DEFB    "Already installed (REUDISK F re-formats B:).",13,10,"$"
 m_noreu:
         DEFB    "No REU found (enable a 512K REU) - aborted.",13,10,"$"
 m_small:
         DEFB    "REU is smaller than 512K - aborted.",13,10,"$"
 
+biosbase:
+        DEFW    0
 opt:    DEFB    0
 tbyte:  DEFB    0
 
-; --- resident image, copied to RES_BASE ($B000) -------------------------------
+; --- 6510 trampoline image, copied to TRAMP_Z80 ($F980 = 6510 $0980) ---------
+trampimg:
+        INCBIN  "reu6510.bin"
+trampimg_end:
+
+; --- Z80 resident image, copied to RES_BASE ($FE00 = 6510 $0E00) -------------
 resimg:
         INCBIN  "reudrv.bin"
 resimg_end:

@@ -18,12 +18,13 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import cpmd64  # noqa: E402
 
 BLS, DRM, REC = 2048, 127, 128
+OFF_BYTES = 1 * 128 * 128  # Track 0 (16 KB) is reserved (OFF = 1) for WBOOT cache
 
 
 def files(img):
     res = {}
     for i in range(DRM + 1):
-        e = img[i * 32:(i + 1) * 32]
+        e = img[OFF_BYTES + i * 32:OFF_BYTES + (i + 1) * 32]
         if e[0] > 15:
             continue
         name = cpmd64.CpmDisk.name_of(e)
@@ -35,12 +36,11 @@ def get(img, name):
     ents = sorted(files(img)[name], key=lambda e: e[12] + 32 * e[14])
     out = bytearray()
     for e in ents:
-        # EXM=1: one directory entry = 2 logical extents, 8 x 16-bit... no:
         # DSM<256 -> 16 one-byte block pointers per entry (16 x 2 KB = 32 KB)
         data = bytearray()
         for b in e[16:32]:
             if b:
-                data += img[b * BLS:(b + 1) * BLS]
+                data += img[OFF_BYTES + b * BLS:OFF_BYTES + (b + 1) * BLS]
         recs = (e[12] & 1) * 128 + e[15]      # records in this entry
         out += data[:recs * REC]
     return bytes(out)

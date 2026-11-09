@@ -51,7 +51,7 @@ def make_submit(commands):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument('--cpm-disk', default=os.path.join(ROOT, 'work', 'c64-cpm.d64'),
+    ap.add_argument('--cpm-disk', default=os.path.join(ROOT, 'cpm80.d64'),
                     help='original Commodore 64 CP/M 2.2 boot disk (.d64)')
     ap.add_argument('--test', action='store_true',
                     help='add an auto-running $$$.SUB test script to the disk')
@@ -63,7 +63,7 @@ def main():
     print('[1/4] 6510 trampoline')
     run(ca65, '-o', 'reu6510.o', '-l', 'reu6510.lst', os.path.join(SRC, 'reu6510.s'))
     run(ld65, '-C', os.path.join(SRC, 'reu6510.cfg'), '-o', 'reu6510.bin', 'reu6510.o')
-    assert os.path.getsize(os.path.join(BUILD, 'reu6510.bin')) == 256
+    assert os.path.getsize(os.path.join(BUILD, 'reu6510.bin')) == 64
 
     print('[2/4] Z80 resident driver')
     run(pasmo, '--public', '-I', SRC, '-I', BUILD,
@@ -80,13 +80,22 @@ def main():
     with open(os.path.join(BUILD, 'REUDISK.COM'), 'rb') as f:
         d.put('REUDISK.COM', f.read())
     if args.test:
+        # On cpm80.d64, BIOS MSGPTR at $BA66 (T2 S11 +0x66) is pre-loaded with
+        # $FC82 ("SOFT80\r") so CONST returns 0FFh at boot, which would cause
+        # the CCP to abort $$$.SUB. Zeroing MSGPTR lets $$$.SUB run SOFT80 +
+        # REUDISK + PIP unattended.
+        t2s11 = cpmd64.d64_offset(2, 11)
+        if d.img[t2s11 + 0x66:t2s11 + 0x68] == b'\x82\xfc':
+            d.img[t2s11 + 0x66:t2s11 + 0x68] = b'\x00\x00'
         d.put('$$$.SUB', make_submit([
+            'SOFT80',
             'REUDISK',
             'STAT B:DSK:',
-            'PIP B:=A:*.*[V]',
+            'PIP B:=A:*.COM[V]',
+            'B:',
             'PIP B:PIP2.COM=B:PIP.COM[V]',
-            'DIR B:',
-            'STAT B:',
+            'DIR',
+            'STAT',
         ]))
     d.save()
     d.ls()

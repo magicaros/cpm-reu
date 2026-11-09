@@ -1,64 +1,39 @@
 ; =============================================================================
 ;  reudrv.z80 - resident Z80 part of the C64 CP/M 2.2 REU RAM-disk (drive B:)
+;               with Instant REU-Backed Warm Boot (WBOOT Caching)
 ; =============================================================================
 ;
 ;  Assembler : pasmo 0.5.x   (pasmo --public reudrv.z80 reudrv.bin reudrv.sym)
-;  Location  : Z80 $B000-$B3xx  (6510 $C000-$C3xx), above the stock 44K BIOS
-;              whose last byte (drive B: CSV) is at $AFCD. Warm boot only
-;              reloads CCP+BDOS ($9400-$A9FF), so this block survives WBOOT.
+;  Location  : Z80 $FE00-$FFxx  (6510 $0E00-$0Fxx)
+;              6510 trampoline sits at Z80 $F980-$F9BF (6510 $0980-$09BF).
 ;
-;  Block layout
-;      $B000-$B0FF  6510 trampoline + parameter block (src/reu6510.s, INCBIN)
-;      $B100-...    Z80 hooks, private DPH/DPB/ALV/DIRBUF for drive B:
-;
-;  BIOS jump-table hooking (done once by REUDISK.COM)
-;  --------------------------------------------------
-;  Each hooked BIOS jump-table entry is redirected to an h_xxx routine below.
-;  The original target is copied into the operand of a "JP 0" located at
-;  o_xxx, so pass-through costs a single JP and leaves every register intact.
-;
-;      entry   hook        drive A: (and C:..P:)    drive B:
-;      WBOOT   h_wboot     reset our state, then original WBOOT
-;      HOME    h_home      original                 track := 0
-;      SELDSK  h_seldsk    original (stock DPH)     HL := dph_b (private)
-;      SETTRK  h_settrk    original                 remembered locally only
-;      SETSEC  h_setsec    original                 remembered locally only
-;      SETDMA  h_setdma    always forwarded AND remembered (drive-independent)
-;      READ    h_read      original (deblocking)    REU fetch, 128 bytes
-;      WRITE   h_write     original (deblocking)    REU stash, 128 bytes
-;
-;  Drive B: never touches the stock deblocking variables, host buffer ($F800),
-;  DPH, ALV or CSV, so the dual-drive buffer-sharing problem of the stock
-;  BIOS cannot occur: PIP B:=A:*.* reads A: through the untouched stock code
-;  and writes B: through completely separate state.
-;
-;  Why WBOOT and HOME too?  The stock WBOOT calls its SELDSK/SETDMA routines
-;  directly (not through the jump table), so our idea of the "current drive"
-;  and DMA address must be reset there.  HOME is called by the BDOS on drive
-;  login/directory scans and must not reach the stock code with B: selected.
-;  SECTRAN is left alone: the stock one is an identity (BC -> HL), which is
-;  exactly what drive B: (XLT = 0) needs.
+;  INSTANT REU WARM BOOT (WBOOT CACHING)
+;  -------------------------------------
+;  Track 0 of Drive B: (REU Bank 0, $0000-$15FF) is reserved (OFF = 1 in DPB)
+;  and holds a pristine 5.5 KB ($1600-byte) image of CCP + BDOS captured at
+;  install time.
+;  When any program exits (JP 0000h or Ctrl+C):
+;    1. h_wboot flushes any dirty Drive A: host buffer via BIOS HOME,
+;    2. triggers a single 5632-byte REU FETCH from Bank 0:$0000 to CCP_BASE,
+;    3. restores page-0 vectors (0000h JP WBOOT, 0005h JP BDOS) and default
+;       DMA ($0080),
+;    4. validates current drive in (0004h) (falls back to A: if >= 2), and
+;       jumps straight to CCP_BASE with C = current drive!
+;  Warm boot takes ~5.6 milliseconds (0 floppy seeks) and works even when B:
+;  is the active logged-in drive!
 ; =============================================================================
 
         INCLUDE "reushared.inc"
 
         PUBLIC  r_sig, r_table, r_end, h_seldsk, call65, dph_b, dpb_b
+        PUBLIC  wbootv, bdosv, ccp65, ccpz80
 
         ORG     RES_BASE
 
 ; -----------------------------------------------------------------------------
-;  $B000: 6510 code (one page). Z80 never executes this.
+;  $FE00: Z80 resident code (<= 512 bytes, fits in $FE00-$FFFF)
 ; -----------------------------------------------------------------------------
-r_6510:
-        INCBIN  "reu6510.bin"
-        IF      $ - r_6510 - 256
-        .ERROR  "reu6510.bin must be exactly 256 bytes"
-        ENDIF
-
-; -----------------------------------------------------------------------------
-;  $B100: Z80 resident code
-; -----------------------------------------------------------------------------
-r_sig:  DEFB    "REUDISK1"      ; installation signature (checked by installer)
+r_sig:  DEFB    "REUDISK3"      ; installation signature (checked by installer)
 
 ; Hook table used by the installer:  BIOS entry number, hook, pass-through JP
 r_table:
@@ -80,22 +55,63 @@ r_table:
         DEFW    h_write, o_write
         DEFB    0FFh            ; end of table
 
-; --- driver state ------------------------------------------------------------
+; --- driver state & warm-boot parameters (filled by installer) ---------------
 curdrv: DEFB    0               ; drive last passed to SELDSK (0=A:, 1=B:)
 btrk:   DEFW    0               ; drive B: track   (0..31)
 bsec:   DEFB    0               ; drive B: sector  (0..127, physical = logical)
 bdma:   DEFW    0080h           ; current CP/M DMA address (Z80 view)
+wbootv: DEFW    0               ; BIOS_BASE + 3 (for 0001h)
+bdosv:  DEFW    0               ; BDOS entry    (for 0006h)
+ccp65:  DEFW    0               ; 6510 address of CCP (Z80 CCP + $1000)
 
 ; -----------------------------------------------------------------------------
-;  WBOOT: stock code re-selects A: and sets DMA=$0080 internally
+;  WBOOT: Instant REU-backed warm boot (~5.6 ms via DMA from REU Bank 0:$0000)
 ; -----------------------------------------------------------------------------
 h_wboot:
+        ld      sp,0080h
+        call    o_home          ; flush Drive A: host buffer if dirty (HSTWRT)
         xor     a
         ld      (curdrv),a
-        ld      hl,0080h
-        ld      (bdma),hl
+        ld      (PB_REU),a      ; REU $0000
+        ld      (PB_REU+1),a
+        ld      (PB_BANK),a     ; REU Bank 0 (Track 0 system cache)
+        ld      (PB_IMASK),a
+        ld      (PB_ACR),a
+        ld      (PB_STATUS),a
+        ld      hl,(ccp65)      ; 6510 destination = CCP_BASE + $1000
+        ld      (PB_C64),hl
+        ld      hl,WB_LEN       ; 5632 bytes (CCP + BDOS)
+        ld      (PB_LEN),hl
+        ld      a,REU_FETCH
+        ld      (PB_CMD),a
+        call    call65          ; DMA reload CCP + BDOS in 5632 cycles!
+        ld      a,(PB_STATUS)
+        and     REU_EOB
+        jr      z,o_wboot       ; fallback to floppy WBOOT if REU error
+
+        ld      a,0C3h          ; restore Page 0 vectors
+        ld      (0000h),a
+        ld      hl,(wbootv)
+        ld      (0001h),hl
+        ld      (0005h),a
+        ld      hl,(bdosv)
+        ld      (0006h),hl
+
+        ld      bc,0080h        ; default DMA = $0080
+        call    h_setdma
+
+        ld      a,(0004h)       ; current drive (low nibble) / user (high nibble)
+        and     0Fh
+        cp      2               ; only drives A: (0) and B: (1) exist
+        ld      a,(0004h)
+        jr      c,wb_ok
+        and     0F0h            ; invalid drive -> reset to A: (keep user#)
+        ld      (0004h),a
+wb_ok:  ld      c,a
+ccpz80  EQU     $+1
+        jp      0               ; jump to CCP_BASE (patched by installer)
 o_wboot:
-        jp      0               ; -> original WBOOT (patched by installer)
+        jp      0               ; -> original floppy WBOOT (patched by installer)
 
 ; -----------------------------------------------------------------------------
 ;  HOME
@@ -249,7 +265,7 @@ xerr:   ld      a,1             ; BDOS will report "Bad Sector"
 ; -----------------------------------------------------------------------------
 call65:
         ld      hl,ENTRY65
-        ld      (B65VEC),hl     ; 6510 $0906/$0907 = $C010
+        ld      (B65VEC),hl     ; 6510 $0906/$0907 = $0990
         ld      a,B65USER
         ld      (B65CMD),a      ; 6510 $0900 = 9 -> JMP ($0906)
         ld      a,1
@@ -260,34 +276,31 @@ call65:
 ; =============================================================================
 ;  Drive B: disk parameters - private to this driver, nothing shared with A:
 ; =============================================================================
-;  512 KB, 2 KB blocks: BLS=2048 -> BSH=4 BLM=15, DSM=255 (<256) -> EXM=1
-;  128 directory entries = 4 KB = 2 blocks -> AL0=11000000b
-;  Fixed (non-removable) medium -> CKS=0, no reserved tracks -> OFF=0
+;  Track 0 (16 KB) is reserved (OFF = 1) for the Instant Warm-Boot CCP+BDOS
+;  cache in REU Bank 0 ($0000-$15FF).
+;  Tracks 1..31 = 31 * 16 KB = 496 KB (248 x 2 KB blocks -> DSM = 247).
+;  128 directory entries = 4 KB = 2 blocks -> AL0 = 11000000b.
+;  Fixed (non-removable) medium -> CKS = 0.
 dph_b:  DEFW    0               ; XLT: no sector translation
         DEFW    0, 0, 0         ; BDOS scratch
-        DEFW    dirbuf_b        ; DIRBUF (private 128 bytes)
+        DEFW    DIRBF_B_Z80     ; DIRBUF (private 128 bytes at $F970-$F9EF)
         DEFW    dpb_b           ; DPB
-        DEFW    csv_b           ; CSV (unused because CKS = 0)
-        DEFW    alv_b           ; ALV (private, 32 bytes)
+        DEFW    0               ; CSV (unused because CKS = 0)
+        DEFW    ALV_B_Z80       ; ALV (private 32 bytes at $F950-$F96F)
 
-dpb_b:  DEFW    B_SPT           ; SPT  records per track
+dpb_b:  DEFW    B_SPT           ; SPT  records per track (128)
         DEFB    4               ; BSH  block shift  (2 KB)
         DEFB    15              ; BLM  block mask
         DEFB    1               ; EXM  extent mask
-        DEFW    255             ; DSM  highest block number (256 x 2 KB)
+        DEFW    B_DSM           ; DSM  highest block number (247 -> 248 x 2 KB = 496 KB)
         DEFW    127             ; DRM  highest directory entry (128 entries)
         DEFB    0C0h, 00h       ; AL0, AL1: blocks 0,1 reserved for directory
         DEFW    0               ; CKS  no directory checksums
-        DEFW    0               ; OFF  no system tracks
-
-csv_b:  DEFS    1               ; placeholder, never written (CKS = 0)
-alv_b:  DEFS    32              ; allocation vector: 256 blocks / 8
-dirbuf_b:
-        DEFS    128             ; directory buffer
+        DEFW    B_OFF           ; OFF  1 reserved track (Track 0 = WBOOT cache)
 
 r_end:
-        IF      r_end > 0C000h
-        .ERROR  "resident block overflows Z80 $BFFF"
+        IF      r_end - RES_BASE > 512
+        .ERROR  "resident block overflows Z80 $FFFF"
         ENDIF
 
         END

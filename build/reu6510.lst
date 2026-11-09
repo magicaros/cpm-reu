@@ -7,7 +7,18 @@ Current file: /home/magicben/Documents/Projets/cpm-reu/src/reu6510.s
 000000r 1               ; =============================================================================
 000000r 1               ;
 000000r 1               ;  Assembler : ca65 (cc65 suite)          ld65 config: src/reu6510.cfg
-000000r 1               ;  Load addr : 6510 $C000  (= Z80 $B000 because Z80 addr = 6510 addr - $1000)
+000000r 1               ;  Load addr : 6510 $0980  (= Z80 $F980 because Z80 addr = 6510 addr - $1000)
+000000r 1               ;
+000000r 1               ;  UNIVERSAL PLACEMENT (44K, 48K, AND SOFT80 COMPATIBLE)
+000000r 1               ;  -----------------------------------------------------
+000000r 1               ;  Page $0900-$09FF (Z80 $F900-$F9FF) is the BIOS65 communication page:
+000000r 1               ;      $0900-$0907  Command/data/sector/track/drive/key/indirect vector
+000000r 1               ;      $0908-$09FE  Completely unused by BIOS65, CP/M 44K/48K, and SOFT80.COM
+000000r 1               ;      $09FF        Printer status byte
+000000r 1               ;  Placing the 16-byte parameter block at $0980-$098F and the 6510 REU DMA
+000000r 1               ;  trampoline at $0990-$09BF avoids touching $C000-$CFFF (which holds the
+000000r 1               ;  48K BDOS/BIOS on 48K CP/M disks) and avoids $0400-$05FF / $D000-$FFFF
+000000r 1               ;  (which are used by SOFT80.COM).
 000000r 1               ;
 000000r 1               ;  HOW THE 6510 GETS HERE
 000000r 1               ;  ----------------------
@@ -23,21 +34,6 @@ Current file: /home/magicben/Documents/Projets/cpm-reu/src/reu6510.s
 000000r 1               ;
 000000r 1               ;    The dispatcher at $0A0C jumps through a table at $0A28; command 9 is the
 000000r 1               ;    "user" command:   $0A3C  JMP ($0906)
-000000r 1               ;
-000000r 1               ;  The Z80 driver therefore:
-000000r 1               ;      1. fills the parameter block below (6510 $C000 = Z80 $B000),
-000000r 1               ;      2. stores ENTRY's address in the user vector $0906/$0907 (Z80 $F906),
-000000r 1               ;      3. stores 9 in the command byte $0900 (Z80 $F900),
-000000r 1               ;      4. writes 1 to Z80 $CE00 (= 6510 $DE00): the Z80 stops, the 6510 wakes
-000000r 1               ;         up after its STA $DE00, dispatches command 9 and lands in ENTRY.
-000000r 1               ;  ENTRY performs the REU DMA and simply RTSes; BIOS65 then executes its own
-000000r 1               ;  "LDA #0 / STA $DE00" which restarts the Z80 right after its $CE00 write.
-000000r 1               ;  Re-using BIOS65's handshake (instead of doing our own STA $DE00 here) keeps
-000000r 1               ;  the 6510's "resume point" inside BIOS65, so console/disk commands issued
-000000r 1               ;  later by the stock Z80 BIOS keep working.
-000000r 1               ;
-000000r 1               ;  Memory: 6510 $C000-$CFFF is not used by CP/M, BIOS65, the KERNAL or the VIC
-000000r 1               ;  (VIC bank 0, screen at $0400) - it is the classic free 4K block.
 000000r 1               ; =============================================================================
 000000r 1               
 000000r 1                       .setcpu "6502"
@@ -59,7 +55,7 @@ Current file: /home/magicben/Documents/Projets/cpm-reu/src/reu6510.s
 000000r 1                       .segment "CODE"
 000000r 1               
 000000r 1               ; =============================================================================
-000000r 1               ;  Shared parameter block - 6510 $C000..$C00F  /  Z80 $B000..$B00F
+000000r 1               ;  Shared parameter block - 6510 $0980..$098F  /  Z80 $F980..$F98F
 000000r 1               ;  Bytes +1..+10 are laid out exactly like REU registers $DF01..$DF0A so the
 000000r 1               ;  copy loop below is a straight indexed move.  Filled by the Z80 driver.
 000000r 1               ; =============================================================================
@@ -76,36 +72,42 @@ Current file: /home/magicben/Documents/Projets/cpm-reu/src/reu6510.s
 00000Cr 1  00 00 00 00              .res  4, $00        ; +12..+15 reserved
 000010r 1               
 000010r 1               ; =============================================================================
-000010r 1               ;  ENTRY - 6510 $C010.  Reached by JSR $0A0C -> JMP ($0A3A) -> JMP ($0906).
+000010r 1               ;  ENTRY - 6510 $0990.  Reached by JSR $0A0C -> JMP ($0A3A) -> JMP ($0906).
 000010r 1               ;  In : parameter block above.     Out: PB_STATUS = REU status register.
-000010r 1               ;  Preserves the caller's interrupt flag; A/X/Y are not needed by BIOS65.
+000010r 1               ;  Preserves the caller's interrupt flag and 6510 $01 memory banking.
 000010r 1               ; =============================================================================
 000010r 1               ENTRY:
-000010r 1  08                   php                     ; remember the I flag BIOS65 runs with (CLI'd:
-000011r 1  78                   sei                     ; KERNAL keyboard IRQ) and block IRQs so no
-000012r 1                                               ; IRQ handler can touch the REU/IO mid-setup
+000010r 1  08                   php                     ; remember the I flag BIOS65 runs with
+000011r 1  78                   sei                     ; block IRQs during REU register setup & DMA
 000012r 1  D8                   cld
 000013r 1               
-000013r 1  A2 09                ldx     #9              ; copy PB+2..PB+10 -> $DF02..$DF0A (X = 9..1)
-000015r 1  BD rr rr     @copy:  lda     PB_CMD,x
-000018r 1  9D 01 DF             sta     REU_CMD,x
-00001Br 1  CA                   dex
-00001Cr 1  D0 F7                bne     @copy
-00001Er 1               
-00001Er 1  AD 00 DF             lda     REU_STATUS      ; reading $DF00 clears stale EOB/IRQ bits
-000021r 1               
-000021r 1  AD rr rr             lda     PB_CMD          ; bit7=execute, bit4=start now (no $FF00 wait)
-000024r 1  8D 01 DF             sta     REU_CMD         ; the REU asserts DMA and freezes the 6510
-000027r 1                                               ; until all bytes are moved (1 byte/cycle)
-000027r 1               
-000027r 1  AD 00 DF             lda     REU_STATUS      ; b6 = end of block -> Z80 checks it
-00002Ar 1  8D rr rr             sta     PB_STATUS       ; (read also acknowledges the status)
-00002Dr 1               
-00002Dr 1  28                   plp                     ; restore the caller's interrupt state
-00002Er 1  60                   rts                     ; back to BIOS65 -> LDA #0 / STA $DE00 -> Z80
-00002Fr 1               ENTRY_END:
-00002Fr 1               
-00002Fr 1                       .assert ENTRY = PB + 16, error, "ENTRY must sit at $C010"
-00002Fr 1                       .assert ENTRY_END <= $C100, lderror, "6510 module must fit in one page"
-00002Fr 1                       ; ld65 pads the output to exactly one page (Z80 $B000-$B0FF).
-00002Fr 1               
+000013r 1  A5 01                lda     $01             ; save 6510 processor port
+000015r 1  48                   pha
+000016r 1  A9 35                lda     #$35            ; bank out BASIC ($A000-$BFFF) and KERNAL
+000018r 1  85 01                sta     $01             ; ($E000-$FFFF) -> ALL RAM visible to REU DMA
+00001Ar 1                                               ; except I/O ($D000-$DFFF -> REU at $DF00)!
+00001Ar 1               
+00001Ar 1  A2 09                ldx     #9              ; copy PB+2..PB+10 -> $DF02..$DF0A (X = 9..1)
+00001Cr 1  BD rr rr     @copy:  lda     PB_CMD,x
+00001Fr 1  9D 01 DF             sta     REU_CMD,x
+000022r 1  CA                   dex
+000023r 1  D0 F7                bne     @copy
+000025r 1               
+000025r 1  AD 00 DF             lda     REU_STATUS      ; reading $DF00 clears stale EOB/IRQ bits
+000028r 1               
+000028r 1  AD rr rr             lda     PB_CMD          ; bit7=execute, bit4=start now (no $FF00 wait)
+00002Br 1  8D 01 DF             sta     REU_CMD         ; the REU asserts DMA and freezes the 6510
+00002Er 1                                               ; until all bytes are moved (1 byte/cycle)
+00002Er 1               
+00002Er 1  AD 00 DF             lda     REU_STATUS      ; b6 = end of block -> Z80 checks it
+000031r 1  8D rr rr             sta     PB_STATUS       ; (read also acknowledges the status)
+000034r 1               
+000034r 1  68                   pla                     ; restore 6510 processor port ($01 = $36)
+000035r 1  85 01                sta     $01
+000037r 1  28                   plp                     ; restore the caller's interrupt state
+000038r 1  60                   rts                     ; back to BIOS65 -> LDA #0 / STA $DE00 -> Z80
+000039r 1               ENTRY_END:
+000039r 1               
+000039r 1                       .assert ENTRY = PB + 16, error, "ENTRY must sit at $0920"
+000039r 1                       .assert ENTRY_END <= $0950, lderror, "6510 module must fit in 64 bytes"
+000039r 1               
