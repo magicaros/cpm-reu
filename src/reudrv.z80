@@ -1,0 +1,293 @@
+; =============================================================================
+;  reudrv.z80 - resident Z80 part of the C64 CP/M 2.2 REU RAM-disk (drive B:)
+; =============================================================================
+;
+;  Assembler : pasmo 0.5.x   (pasmo --public reudrv.z80 reudrv.bin reudrv.sym)
+;  Location  : Z80 $B000-$B3xx  (6510 $C000-$C3xx), above the stock 44K BIOS
+;              whose last byte (drive B: CSV) is at $AFCD. Warm boot only
+;              reloads CCP+BDOS ($9400-$A9FF), so this block survives WBOOT.
+;
+;  Block layout
+;      $B000-$B0FF  6510 trampoline + parameter block (src/reu6510.s, INCBIN)
+;      $B100-...    Z80 hooks, private DPH/DPB/ALV/DIRBUF for drive B:
+;
+;  BIOS jump-table hooking (done once by REUDISK.COM)
+;  --------------------------------------------------
+;  Each hooked BIOS jump-table entry is redirected to an h_xxx routine below.
+;  The original target is copied into the operand of a "JP 0" located at
+;  o_xxx, so pass-through costs a single JP and leaves every register intact.
+;
+;      entry   hook        drive A: (and C:..P:)    drive B:
+;      WBOOT   h_wboot     reset our state, then original WBOOT
+;      HOME    h_home      original                 track := 0
+;      SELDSK  h_seldsk    original (stock DPH)     HL := dph_b (private)
+;      SETTRK  h_settrk    original                 remembered locally only
+;      SETSEC  h_setsec    original                 remembered locally only
+;      SETDMA  h_setdma    always forwarded AND remembered (drive-independent)
+;      READ    h_read      original (deblocking)    REU fetch, 128 bytes
+;      WRITE   h_write     original (deblocking)    REU stash, 128 bytes
+;
+;  Drive B: never touches the stock deblocking variables, host buffer ($F800),
+;  DPH, ALV or CSV, so the dual-drive buffer-sharing problem of the stock
+;  BIOS cannot occur: PIP B:=A:*.* reads A: through the untouched stock code
+;  and writes B: through completely separate state.
+;
+;  Why WBOOT and HOME too?  The stock WBOOT calls its SELDSK/SETDMA routines
+;  directly (not through the jump table), so our idea of the "current drive"
+;  and DMA address must be reset there.  HOME is called by the BDOS on drive
+;  login/directory scans and must not reach the stock code with B: selected.
+;  SECTRAN is left alone: the stock one is an identity (BC -> HL), which is
+;  exactly what drive B: (XLT = 0) needs.
+; =============================================================================
+
+        INCLUDE "reushared.inc"
+
+        PUBLIC  r_sig, r_table, r_end, h_seldsk, call65, dph_b, dpb_b
+
+        ORG     RES_BASE
+
+; -----------------------------------------------------------------------------
+;  $B000: 6510 code (one page). Z80 never executes this.
+; -----------------------------------------------------------------------------
+r_6510:
+        INCBIN  "reu6510.bin"
+        IF      $ - r_6510 - 256
+        .ERROR  "reu6510.bin must be exactly 256 bytes"
+        ENDIF
+
+; -----------------------------------------------------------------------------
+;  $B100: Z80 resident code
+; -----------------------------------------------------------------------------
+r_sig:  DEFB    "REUDISK1"      ; installation signature (checked by installer)
+
+; Hook table used by the installer:  BIOS entry number, hook, pass-through JP
+r_table:
+        DEFB    1               ; WBOOT
+        DEFW    h_wboot, o_wboot
+        DEFB    8               ; HOME
+        DEFW    h_home, o_home
+        DEFB    9               ; SELDSK
+        DEFW    h_seldsk, o_seldsk
+        DEFB    10              ; SETTRK
+        DEFW    h_settrk, o_settrk
+        DEFB    11              ; SETSEC
+        DEFW    h_setsec, o_setsec
+        DEFB    12              ; SETDMA
+        DEFW    h_setdma, o_setdma
+        DEFB    13              ; READ
+        DEFW    h_read, o_read
+        DEFB    14              ; WRITE
+        DEFW    h_write, o_write
+        DEFB    0FFh            ; end of table
+
+; --- driver state ------------------------------------------------------------
+curdrv: DEFB    0               ; drive last passed to SELDSK (0=A:, 1=B:)
+btrk:   DEFW    0               ; drive B: track   (0..31)
+bsec:   DEFB    0               ; drive B: sector  (0..127, physical = logical)
+bdma:   DEFW    0080h           ; current CP/M DMA address (Z80 view)
+
+; -----------------------------------------------------------------------------
+;  WBOOT: stock code re-selects A: and sets DMA=$0080 internally
+; -----------------------------------------------------------------------------
+h_wboot:
+        xor     a
+        ld      (curdrv),a
+        ld      hl,0080h
+        ld      (bdma),hl
+o_wboot:
+        jp      0               ; -> original WBOOT (patched by installer)
+
+; -----------------------------------------------------------------------------
+;  HOME
+; -----------------------------------------------------------------------------
+h_home:
+        ld      a,(curdrv)
+        dec     a
+        jr      nz,o_home       ; not B: -> stock HOME
+        ld      h,a             ; A = 0 here
+        ld      l,a
+        ld      (btrk),hl       ; B: track 0
+        ret
+o_home:
+        jp      0
+
+; -----------------------------------------------------------------------------
+;  SELDSK  C = drive (0=A:), E bit0 = "already logged in" (ignored for B:)
+;  Returns HL = DPH or 0000 if the drive does not exist.
+; -----------------------------------------------------------------------------
+h_seldsk:
+        ld      a,c
+        ld      (curdrv),a
+        dec     a
+        jr      nz,o_seldsk     ; A:, C:..P: -> stock SELDSK (A: DPH / error)
+        ld      hl,dph_b        ; B: -> our private DPH, nothing shared with A:
+        ret
+o_seldsk:
+        jp      0
+
+; -----------------------------------------------------------------------------
+;  SETTRK  BC = track.  Remembered for B:, forwarded only when B: is not
+;  selected so the stock deblocker's "sektrk" is never polluted by B: values.
+; -----------------------------------------------------------------------------
+h_settrk:
+        ld      (btrk),bc
+        ld      a,(curdrv)
+        dec     a
+        ret     z
+o_settrk:
+        jp      0
+
+; -----------------------------------------------------------------------------
+;  SETSEC  BC = (translated) sector
+; -----------------------------------------------------------------------------
+h_setsec:
+        ld      a,c
+        ld      (bsec),a
+        ld      a,(curdrv)
+        dec     a
+        ret     z
+o_setsec:
+        jp      0
+
+; -----------------------------------------------------------------------------
+;  SETDMA  BC = DMA address.  The DMA address is global in CP/M, so it is
+;  always passed on to the stock BIOS as well.
+; -----------------------------------------------------------------------------
+h_setdma:
+        ld      (bdma),bc
+o_setdma:
+        jp      0
+
+; -----------------------------------------------------------------------------
+;  READ / WRITE   Out: A = 0 ok, 1 = error.  WRITE's C (deferred/dir/unalloc)
+;  is irrelevant: the REU is 128-byte addressable, no deblocking needed.
+; -----------------------------------------------------------------------------
+h_read:
+        ld      a,(curdrv)
+        dec     a
+        jr      nz,o_read
+        ld      a,REU_FETCH     ; REU -> C64 memory
+        jr      xfer
+o_read:
+        jp      0
+
+h_write:
+        ld      a,(curdrv)
+        dec     a
+        jr      nz,o_write
+        ld      a,REU_STASH     ; C64 memory -> REU
+        jr      xfer
+o_write:
+        jp      0
+
+; -----------------------------------------------------------------------------
+;  xfer - marshal (track, sector, DMA) into the 6510 parameter block and run
+;  one 128-byte REU transfer.     In: A = REU command ($90 stash / $91 fetch)
+;
+;  Linear record number  LBA = track * 128 + sector       (0..4095)
+;  REU byte address      LBA * 128 = track << 14 | sector << 7   (19 bits)
+;       bank ($DF06) = track >> 2
+;       high ($DF05) = (track & 3) << 6 | sector >> 1
+;       low  ($DF04) = (sector & 1) << 7
+;  C64 address ($DF02/03) = Z80 DMA address + $1000 (cartridge address offset;
+;  wraps mod 64K exactly like the Z80 view does: Z80 $F000 = 6510 $0000).
+; -----------------------------------------------------------------------------
+xfer:
+        ld      (PB_CMD),a
+        ld      hl,(btrk)
+        ld      a,h
+        or      a
+        jr      nz,xerr         ; track > 255
+        ld      a,l
+        cp      B_TRACKS
+        jr      nc,xerr         ; track >= 32
+        ld      e,a             ; E = track
+        ld      a,(bsec)
+        cp      B_SPT
+        jr      nc,xerr         ; sector >= 128
+        ld      d,a             ; D = sector
+
+        rrca                    ; sector bit 0 -> bit 7
+        and     80h
+        ld      (PB_REU),a      ; REU address bits 0-7
+        ld      a,d
+        srl     a               ; sector >> 1 (0..63)
+        ld      d,a
+        ld      a,e
+        and     3
+        rrca
+        rrca                    ; (track & 3) << 6
+        or      d
+        ld      (PB_REU+1),a    ; REU address bits 8-15
+        ld      a,e
+        srl     a
+        srl     a
+        ld      (PB_BANK),a     ; REU address bits 16-18 (bank 0..7)
+
+        ld      hl,(bdma)
+        ld      de,Z2C
+        add     hl,de           ; Z80 DMA address -> 6510 address
+        ld      (PB_C64),hl
+        ld      hl,128
+        ld      (PB_LEN),hl     ; one CP/M record
+        xor     a
+        ld      (PB_IMASK),a
+        ld      (PB_ACR),a      ; both addresses increment
+        ld      (PB_STATUS),a
+        call    call65          ; ---- 6510 performs the DMA ----
+        ld      a,(PB_STATUS)
+        and     REU_EOB         ; transfer completed?
+        ld      a,0
+        ret     nz              ; yes: A = 0 (flags from AND kept by LD)
+xerr:   ld      a,1             ; BDOS will report "Bad Sector"
+        ret
+
+; -----------------------------------------------------------------------------
+;  call65 - hand the bus to the 6510 and run ENTRY (BIOS65 command 9).
+;  The Z80 is frozen by its write to $CE00 and resumes at the NOP once BIOS65
+;  executes "LDA #0 / STA $DE00" after our 6510 routine returns.
+; -----------------------------------------------------------------------------
+call65:
+        ld      hl,ENTRY65
+        ld      (B65VEC),hl     ; 6510 $0906/$0907 = $C010
+        ld      a,B65USER
+        ld      (B65CMD),a      ; 6510 $0900 = 9 -> JMP ($0906)
+        ld      a,1
+        ld      (CPUSWITCH),a   ; Z80 off, 6510 on ...
+        nop                     ; ... and back: execution continues here
+        ret
+
+; =============================================================================
+;  Drive B: disk parameters - private to this driver, nothing shared with A:
+; =============================================================================
+;  512 KB, 2 KB blocks: BLS=2048 -> BSH=4 BLM=15, DSM=255 (<256) -> EXM=1
+;  128 directory entries = 4 KB = 2 blocks -> AL0=11000000b
+;  Fixed (non-removable) medium -> CKS=0, no reserved tracks -> OFF=0
+dph_b:  DEFW    0               ; XLT: no sector translation
+        DEFW    0, 0, 0         ; BDOS scratch
+        DEFW    dirbuf_b        ; DIRBUF (private 128 bytes)
+        DEFW    dpb_b           ; DPB
+        DEFW    csv_b           ; CSV (unused because CKS = 0)
+        DEFW    alv_b           ; ALV (private, 32 bytes)
+
+dpb_b:  DEFW    B_SPT           ; SPT  records per track
+        DEFB    4               ; BSH  block shift  (2 KB)
+        DEFB    15              ; BLM  block mask
+        DEFB    1               ; EXM  extent mask
+        DEFW    255             ; DSM  highest block number (256 x 2 KB)
+        DEFW    127             ; DRM  highest directory entry (128 entries)
+        DEFB    0C0h, 00h       ; AL0, AL1: blocks 0,1 reserved for directory
+        DEFW    0               ; CKS  no directory checksums
+        DEFW    0               ; OFF  no system tracks
+
+csv_b:  DEFS    1               ; placeholder, never written (CKS = 0)
+alv_b:  DEFS    32              ; allocation vector: 256 blocks / 8
+dirbuf_b:
+        DEFS    128             ; directory buffer
+
+r_end:
+        IF      r_end > 0C000h
+        .ERROR  "resident block overflows Z80 $BFFF"
+        ENDIF
+
+        END

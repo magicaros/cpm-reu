@@ -1,0 +1,7 @@
+call65		EQU 0B1F5H
+dpb_b		EQU 0B217H
+dph_b		EQU 0B207H
+h_seldsk	EQU 0B153H
+r_end		EQU 0B2C7H
+r_sig		EQU 0B100H
+r_table		EQU 0B108H

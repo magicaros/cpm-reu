@@ -1,0 +1,294 @@
+; =============================================================================
+;  install.z80 - REUDISK.COM : installs the REU RAM-disk as drive B: on the
+;                Commodore 64 CP/M 2.2 (44K) system, at run time.
+; =============================================================================
+;
+;  Assembler : pasmo 0.5.x  (pasmo -I src -I build install.z80 REUDISK.COM)
+;
+;  Usage (at the A> prompt):
+;      REUDISK       install the driver and format B: (512 KB, empty directory)
+;      REUDISK K     install the driver but keep the current REU contents
+;                    (handy with VICE -reuimage/-reuimagerw)
+;      REUDISK F     driver already resident: re-format B:
+;
+;  Steps
+;   1. sanity checks: BIOS at $AA00 (44K C64 CP/M) and BIOS65 command 9
+;      ("JMP ($0906)") present at 6510 $0A3C
+;   2. copy the resident block (6510 trampoline + Z80 hooks + DPH/DPB/ALV)
+;      to Z80 $B000-$B3xx (6510 $C000-$C3xx)
+;   3. probe the REU through the trampoline: 1-byte stash/fetch round trips
+;      to banks 0 and 4 (detects "no REU" and "REU smaller than 512 KB")
+;   4. format: fill all 512 KB with $E5 using fixed-C64-address DMA
+;      (16 transfers of 32 KB from one $E5 byte) -> empty directory
+;   5. patch the BIOS jump table (WBOOT, HOME, SELDSK, SETTRK, SETSEC, SETDMA,
+;      READ, WRITE), saving each original target for pass-through
+;   6. warm boot (JP 0) so the BDOS starts with a clean login vector
+; =============================================================================
+
+        INCLUDE "reushared.inc"
+        INCLUDE "reudrv.sym"    ; public labels of the resident block (pasmo)
+
+BDOS    EQU     0005h
+WBOOTV  EQU     0001h           ; address of the WBOOT jump-table entry
+CMDTAIL EQU     0080h
+
+        ORG     0100h
+
+start:  ld      sp,stack
+        ld      de,m_banner
+        call    print
+
+; --- 1. is this the stock Commodore 64 CP/M 2.2 BIOS? ------------------------
+        ld      hl,(WBOOTV)
+        ld      de,BIOS_BASE+3
+        or      a
+        sbc     hl,de
+        jp      nz,e_bios
+        ld      hl,B65CHK       ; 6510 $0A3C: JMP ($0906)
+        ld      a,(hl)
+        cp      6Ch
+        jp      nz,e_bios
+        inc     hl
+        ld      a,(hl)
+        cp      06h
+        jp      nz,e_bios
+        inc     hl
+        ld      a,(hl)
+        cp      09h
+        jp      nz,e_bios
+
+; --- parse option letter (CCP has already upper-cased the tail) --------------
+        ld      hl,CMDTAIL
+        ld      b,(hl)
+        inc     b
+optlp:  dec     b
+        jr      z,optend
+        inc     hl
+        ld      a,(hl)
+        cp      ' '
+        jr      z,optlp
+        ld      (opt),a
+optend:
+
+; --- already resident? -------------------------------------------------------
+        call    isinst
+        jr      nz,install
+        ld      a,(opt)
+        cp      'F'
+        jp      nz,e_inst
+        call    format
+        ld      de,m_fmt
+        call    print
+        jp      0
+
+; --- 2. copy resident block ---------------------------------------------------
+install:
+        ld      hl,resimg
+        ld      de,RES_BASE
+        ld      bc,resimg_end-resimg
+        ldir
+
+; --- 3. probe REU ------------------------------------------------------------
+        call    reutest
+        jp      nz,e_reu
+
+; --- 4. format (unless K) ----------------------------------------------------
+        ld      a,(opt)
+        cp      'K'
+        jr      z,nofmt
+        call    format
+        ld      de,m_fmt
+        call    print
+nofmt:
+
+; --- 5. hook the BIOS jump table ---------------------------------------------
+        ld      ix,r_table
+patchlp:
+        ld      a,(ix+0)        ; BIOS entry number
+        cp      0FFh
+        jr      z,patched
+        ld      l,a
+        ld      h,0
+        ld      e,l
+        ld      d,h
+        add     hl,hl
+        add     hl,de           ; HL = 3 * n
+        ld      de,BIOS_BASE+1
+        add     hl,de           ; HL -> operand of "JP xxxx" in jump table
+        ld      e,(ix+3)
+        ld      d,(ix+4)
+        inc     de              ; DE -> operand of our pass-through "JP 0"
+        ld      a,(hl)          ; copy original target ...
+        ld      (de),a
+        inc     hl
+        inc     de
+        ld      a,(hl)
+        ld      (de),a
+        ld      a,(ix+2)        ; ... and point the jump table at our hook
+        ld      (hl),a
+        dec     hl
+        ld      a,(ix+1)
+        ld      (hl),a
+        ld      de,5
+        add     ix,de
+        jr      patchlp
+patched:
+        ld      de,m_ok
+        call    print
+        jp      0               ; warm boot through our WBOOT hook
+
+; =============================================================================
+;  isinst - Z set if the driver is already resident and hooked
+; =============================================================================
+isinst: ld      hl,r_sig        ; resident signature (if present)
+        ld      de,resimg+(r_sig-RES_BASE)  ; reference copy in this .COM
+        ld      b,8
+islp:   ld      a,(de)
+        cp      (hl)
+        ret     nz
+        inc     hl
+        inc     de
+        djnz    islp
+        ld      hl,(BIOS_BASE+9*3+1)        ; SELDSK target
+        ld      de,h_seldsk
+        or      a
+        sbc     hl,de
+        ret
+
+; =============================================================================
+;  reu1 - one-byte transfer between 'tbyte' and REU bank B, address $0000
+;  In: A = REU command, B = bank
+; =============================================================================
+reu1:   ld      (PB_CMD),a
+        ld      a,b
+        ld      (PB_BANK),a
+        ld      hl,tbyte+Z2C
+        ld      (PB_C64),hl
+        ld      hl,0
+        ld      (PB_REU),hl
+        inc     hl
+        ld      (PB_LEN),hl
+        xor     a
+        ld      (PB_IMASK),a
+        ld      (PB_ACR),a
+        ld      (PB_STATUS),a
+        jp      call65
+
+; =============================================================================
+;  reutest - Z set if a >= 512 KB REU answers.  NZ: A=1 no REU, A=2 too small.
+;  (destructive for two bytes; only used before formatting/installing)
+; =============================================================================
+reutest:
+        ld      a,(PB_MAGIC)
+        cp      65h
+        jr      nz,noreu        ; trampoline not where we expect it
+        ld      a,0A5h
+        ld      (tbyte),a
+        ld      a,REU_STASH
+        ld      b,0
+        call    reu1            ; bank 0 := $A5
+        ld      a,05Ah
+        ld      (tbyte),a
+        ld      a,REU_STASH
+        ld      b,4
+        call    reu1            ; bank 4 := $5A (aliases bank 0 if <= 256 KB)
+        xor     a
+        ld      (tbyte),a
+        ld      a,REU_FETCH
+        ld      b,0
+        call    reu1
+        ld      a,(tbyte)
+        cp      05Ah
+        jr      z,small         ; bank 4 overwrote bank 0
+        cp      0A5h
+        jr      nz,noreu
+        xor     a
+        ld      (tbyte),a
+        ld      a,REU_FETCH
+        ld      b,4
+        call    reu1
+        ld      a,(tbyte)
+        cp      05Ah
+        jr      nz,noreu
+        xor     a               ; Z: ok
+        ret
+small:  ld      a,2
+        or      a
+        ret
+noreu:  ld      a,1
+        or      a
+        ret
+
+; =============================================================================
+;  format - fill REU banks 0-7 with $E5 (empty CP/M directory and data)
+;  Uses ACR bit 7 (fixed C64 address): the REU reads the same $E5 byte 32768
+;  times per transfer, 16 transfers = 512 KB, about half a second.
+; =============================================================================
+format: ld      a,0E5h
+        ld      (tbyte),a
+        ld      hl,tbyte+Z2C
+        ld      (PB_C64),hl
+        ld      hl,0
+        ld      (PB_REU),hl
+        ld      hl,8000h
+        ld      (PB_LEN),hl
+        xor     a
+        ld      (PB_BANK),a
+        ld      (PB_IMASK),a
+        ld      a,ACR_FIXC64
+        ld      (PB_ACR),a
+        ld      b,16
+fmtlp:  push    bc
+        ld      a,REU_STASH
+        ld      (PB_CMD),a
+        call    call65
+        pop     bc
+        ld      a,(PB_REU+1)    ; next 32 KB: $0000 -> $8000 -> next bank
+        xor     80h
+        ld      (PB_REU+1),a
+        jr      nz,fmtnx
+        ld      hl,PB_BANK
+        inc     (hl)
+fmtnx:  djnz    fmtlp
+        xor     a
+        ld      (PB_ACR),a      ; back to normal addressing
+        ret
+
+; =============================================================================
+print:  ld      c,9
+        jp      BDOS
+
+e_bios: ld      de,m_bios
+        jr      fail
+e_inst: ld      de,m_inst
+        jr      fail
+e_reu:  cp      2
+        ld      de,m_small
+        jr      z,fail
+        ld      de,m_noreu
+fail:   call    print
+        jp      0
+
+m_banner:
+        DEFB    13,10,"REUDISK 1.0 - 512K REU RAM disk for C64 CP/M 2.2",13,10,"$"
+m_ok:   DEFB    "Drive B: = REU RAM disk installed.",13,10,"$"
+m_fmt:  DEFB    "B: formatted (512K, 128 dir entries).",13,10,"$"
+m_bios: DEFB    "Not the C64 CP/M 2.2 44K BIOS - aborted.",13,10,"$"
+m_inst: DEFB    "Already installed (REUDISK F re-formats B:).",13,10,"$"
+m_noreu:
+        DEFB    "No REU found (enable a 512K REU) - aborted.",13,10,"$"
+m_small:
+        DEFB    "REU is smaller than 512K - aborted.",13,10,"$"
+
+opt:    DEFB    0
+tbyte:  DEFB    0
+
+; --- resident image, copied to RES_BASE ($B000) -------------------------------
+resimg:
+        INCBIN  "reudrv.bin"
+resimg_end:
+
+        DEFS    64
+stack:
+
+        END
